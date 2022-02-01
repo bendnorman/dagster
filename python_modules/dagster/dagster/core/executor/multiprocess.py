@@ -2,7 +2,11 @@ import os
 import sys
 
 from dagster import EventMetadataEntry, check
-from dagster.core.errors import DagsterExecutionInterruptedError, DagsterSubprocessError
+from dagster.core.errors import (
+    DagsterExecutionInterruptedError,
+    DagsterSubprocessError,
+    DagsterUnmetExecutorRequirementsError,
+)
 from dagster.core.events import DagsterEvent, EngineEventData
 from dagster.core.execution.api import create_execution_plan, execute_plan_iterator
 from dagster.core.execution.context.system import PlanOrchestrationContext
@@ -11,7 +15,6 @@ from dagster.core.execution.plan.plan import ExecutionPlan
 from dagster.core.execution.retries import RetryMode
 from dagster.core.executor.base import Executor
 from dagster.core.instance import DagsterInstance
-from dagster.seven import multiprocessing
 from dagster.utils import start_termination_thread
 from dagster.utils.error import serializable_error_info_from_exc_info
 from dagster.utils.timing import format_duration, time_execution_scope
@@ -85,10 +88,24 @@ class MultiprocessExecutorChildProcessCommand(ChildProcessCommand):
 
 
 class MultiprocessExecutor(Executor):
-    def __init__(self, retries, max_concurrent=None):
+    def __init__(self, retries, max_concurrent, start_method):
+        # inline import to pervent accidental use of non context set multiprocessing
+        import multiprocessing
+
         self._retries = check.inst_param(retries, "retries", RetryMode)
         max_concurrent = max_concurrent if max_concurrent else multiprocessing.cpu_count()
-        self.max_concurrent = check.int_param(max_concurrent, "max_concurrent")
+        self._max_concurrent = check.int_param(max_concurrent, "max_concurrent")
+        start_method = check.str_param(start_method, "start_method")
+        valid_starts = multiprocessing.get_all_start_methods()
+        if start_method not in valid_starts:
+            raise DagsterUnmetExecutorRequirementsError(
+                f"The selected start_method '{start_method}' is not available. "
+                f"Only {valid_starts} are valid options on this machine.",
+            )
+        self._multiprocessing = multiprocessing.get_context(start_method)
+        if start_method == "forkserver":
+            # preload at least dagster in to the fork server process
+            self._multiprocessing.set_forkserver_preload(["dagster"])
 
     @property
     def retries(self):
@@ -100,7 +117,7 @@ class MultiprocessExecutor(Executor):
 
         pipeline = plan_context.reconstructable_pipeline
 
-        limit = self.max_concurrent
+        limit = self._max_concurrent
 
         yield DagsterEvent.engine_event(
             plan_context,
@@ -146,7 +163,7 @@ class MultiprocessExecutor(Executor):
 
                         for step in steps:
                             step_context = plan_context.for_step(step)
-                            term_events[step.key] = multiprocessing.Event()
+                            term_events[step.key] = self._multiprocessing.Event()
                             active_iters[step.key] = self.execute_step_out_of_process(
                                 pipeline,
                                 step_context,
@@ -265,7 +282,7 @@ class MultiprocessExecutor(Executor):
             step_handle=step.handle,
         )
 
-        for ret in execute_child_process_command(command):
+        for ret in execute_child_process_command(self._multiprocessing, command):
             if ret is None or isinstance(ret, DagsterEvent):
                 yield ret
             elif isinstance(ret, ChildProcessEvent):
